@@ -1,0 +1,141 @@
+# load packages
+Sys.setenv('ARROW_R_DEV' = TRUE)
+Sys.setenv('LIBARROW_BINARY' = FALSE)
+Sys.setenv('LIBARROW_MINIMAL' = FALSE)
+install.packages(c('dplyr', 'readr'))
+library(dplyr)
+library(readr)
+library(arrow)  # server C++ outdated, can only download old version arrow package
+library(stringr)
+library(lubridate)
+
+# list all revelio datasets
+revelio_path <- "/export/storage_revelio_data/data/"
+list.dirs(revelio_path, full.names = FALSE, recursive = FALSE)
+# datasets:"company-ref", "individual-positions", "individual-user", "individual-user-education"
+# "individual-user-skill", "layoffs", "postings", "sentiment", "workforce-dynamics" 
+
+
+# first 5 rows of each dataset
+# company ref dataset
+ds_company_ref <- open_dataset(file.path(revelio_path, "company-ref"))
+head(ds_company_ref, 5) |> collect()
+
+# individual positions
+ds_ind_positions <- open_dataset(file.path(revelio_path, "individual-positions"))
+head(ds_ind_positions, 5) |> collect()
+
+# individual-user
+ds_ind_user <- open_dataset(file.path(revelio_path, "individual-user"))
+head(ds_ind_user, 5) |> collect()
+
+# individual user education
+ds_ind_user_edu <- open_dataset(file.path(revelio_path, "individual-user-education"))
+head(ds_ind_user_edu, 5) |> collect()
+
+# individual-user-skill (top 5)
+ds_ind_user_skill <- open_dataset(file.path(revelio_path, "individual-user-skill"))
+head(ds_ind_user_skill, 5) |> collect()
+
+# layoffs (top 5)
+ds_layoffs <- open_dataset(file.path(revelio_path, "layoffs"))
+head(ds_layoffs, 5) |> collect()
+
+# postings (top 5)
+ds_postings <- open_dataset(file.path(revelio_path, "postings"))
+head(ds_postings, 5) |> collect()
+
+# sentiment (top 5)
+ds_sentiment <- open_dataset(file.path(revelio_path, "sentiment"))
+head(ds_sentiment, 5) |> collect()
+
+# workforce-dynamics (top 5)
+ds_wfd <- open_dataset(file.path(revelio_path, "workforce-dynamics"))
+head(ds_wfd, 5) |> collect()
+
+
+# test UCLA name variants
+edu <- open_dataset(file.path(revelio_path, "individual-user-education")) %>%
+  select(user_id, school, university_name, degree, field, startdate, enddate,
+         university_country, university_location)
+
+ucla_patterns <- c(
+  "\\bUCLA\\b",
+  "\\bUniversity of California[,\\s-]*Los Angeles\\b",
+  "\\bUniversity of California\\s+at\\s+Los Angeles\\b",
+  "\\bUC\\s*Los\\s*Angeles\\b",
+  "\\bUCLA\\s*Anderson\\b",
+  "\\bAnderson\\s+School\\s+of\\s+Management\\b",
+  "\\bHenry\\s+Samueli\\s+School\\b",
+  "\\bDavid\\s+Geffen\\s+School\\s+of\\s+Medicine\\b",
+  "\\bLuskin\\s+School\\s+of\\s+Public\\s+Affairs\\b"
+)
+ucla_rx <- paste(ucla_patterns, collapse = "|")
+
+# filter UCLA affiliated rows in individual edu dataset
+ucla_edu <- edu %>%
+  mutate(school_text = coalesce(university_name, school)) %>%
+  filter(!is.na(school_text)) %>%
+  filter(str_detect(school_text, regex(ucla_rx, ignore_case = TRUE))) %>%
+  select(-school_text)
+
+# count the matched
+ucla_counts <- edu %>%
+  mutate(school_text = coalesce(university_name, school),
+         hit = case_when(
+           str_detect(school_text, regex("\\bUCLA\\b", TRUE)) ~ "UCLA",
+           str_detect(school_text, regex("University of California[,\\s-]*Los Angeles|University of California\\s+at\\s+Los Angeles", TRUE)) ~ "Full name",
+           str_detect(school_text, regex("UCLA\\s*Anderson|Anderson\\s+School\\s+of\\s+Management", TRUE)) ~ "Anderson",
+           str_detect(school_text, regex("Samueli|Geffen|Luskin", TRUE)) ~ "Other UCLA school",
+           TRUE ~ NA_character_
+         )) %>%
+  filter(!is.na(hit)) %>%
+  count(hit, sort = TRUE)
+
+# preview
+ucla_user_sample <- ucla_edu %>%
+  distinct(user_id) %>%
+  head(50) %>%        # just a peek
+  collect()
+ucla_user_sample
+# count the number of each variant
+ucla_counts %>% collect() %>% arrange(desc(n)) %>% print(n = Inf)
+
+
+
+
+
+
+
+#########################################################################
+# database creation starts here
+# open dataset parques
+edu         <- open_dataset(file.path(revelio_path, "individual-user-education"))
+positions   <- open_dataset(file.path(revelio_path, "individual-positions"))
+users       <- open_dataset(file.path(revelio_path, "individual-user"))
+company_ref <- open_dataset(file.path(revelio_path, "company-ref"))
+# filter out UCLA alumni
+ucla_patterns <- c(
+  "\\bUCLA\\b",
+  "\\bUniversity of California[,\\s-]*Los Angeles\\b",
+  "\\bUniversity of California\\s+at\\s+Los Angeles\\b",
+  "\\bUC\\s*Los\\s*Angeles\\b",
+  "\\bUCLA\\s*Anderson\\b",
+  "\\bAnderson\\s+School\\s+of\\s+Management\\b",
+  "\\bHenry\\s+Samueli\\s+School\\b",
+  "\\bDavid\\s+Geffen\\s+School\\s+of\\s+Medicine\\b",
+  "\\bLuskin\\s+School\\s+of\\s+Public\\s+Affairs\\b"
+)
+ucla_rx <- paste(ucla_patterns, collapse = "|")
+
+ucla_edu <- edu %>%
+  mutate(school_text = coalesce(university_name, school)) %>%
+  filter(!is.na(school_text)) %>%
+  filter(str_detect(school_text, regex(ucla_rx, ignore_case = TRUE))) %>%
+  select(user_id, school, university_name, degree, field, startdate, enddate)
+
+# small key only table used to filter other datasets
+ucla_users <- ucla_edu %>% distinct(user_id)
+
+#filter founder/owner
+
