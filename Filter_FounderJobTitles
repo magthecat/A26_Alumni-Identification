@@ -1,0 +1,126 @@
+library(arrow)
+library(dplyr)
+library(stringr)
+
+revelio_path <- "/export/storage_revelio_data/data"
+
+pos <- open_dataset(file.path(revelio_path, "individual-positions")) %>%
+  select(user_id, company_priname, company_linkedin_url, jobtitle_raw, startdate, enddate)
+
+scan_rx <- regex(paste(c(
+  "found", "owner", "partner", "president", "chair", 
+  "\\bceo\\b", "\\bcto\\b", "\\bcoo\\b", "\\bcfo\\b", "\\bcpo\\b",
+  "managing director", "\\bmd\\b", "principal", "proprietor", "entrepreneur"
+), collapse="|"), ignore_case = TRUE)
+
+title_peek <- pos %>%
+  filter(!is.na(jobtitle_raw), str_detect(jobtitle_raw, scan_rx)) %>%
+  count(jobtitle_raw, sort = TRUE) %>%     # all still lazy/Arrow-translatable
+  head(200) %>%                             # keep it small
+  collect() %>%                             # now bring just these 200 rows to R
+  mutate(title_norm = str_squish(str_to_lower(jobtitle_raw))) %>%
+  arrange(desc(n))
+
+print(title_peek, n = 200)
+
+
+
+
+#################################################################################
+# remove false positive titles like "principal"
+library(arrow)
+library(dplyr)
+library(stringr)
+
+revelio_path <- "/export/storage_revelio_data/data"
+
+# 1) Load only the column we need (keeps scanning fast)
+pos <- open_dataset(file.path(revelio_path, "individual-positions")) %>%
+  select(jobtitle_raw) %>%
+  filter(!is.na(jobtitle_raw))
+
+# 2) Patterns — all case-insensitive, so no lowercase needed in Arrow
+include_core_rx <- regex(paste(c(
+  "\\b(co[- ]?)?founder(s)?\\b",
+  "\\bfounding (?:partner|team|member|engineer|cto|ceo|president|director)\\b",
+  "\\bfondateur(?:rice)?\\b","\\bcofondateur(?:rice)?\\b",
+  "\\bfundador(?:a)?\\b","\\bcofundador(?:a)?\\b",
+  "\\bfondatore\\b","\\bcofondatore\\b",
+  "\\bgründer\\b","\\bmitgründer\\b",
+  "\\b(owner|co[- ]?owner|proprietor|sole proprietor)\\b",
+  "\\bpropri[eé]taire\\b","\\bg[ée]rant(?:e)?\\b",
+  "\\bpropietari[oa]\\b","\\bdueñ[oa]\\b",
+  "\\bpropriet[aá]rio\\b","\\bs[óo]ci[ao]\\b",
+  "\\btitolare\\b","\\bsocio\\b",
+  "\\binhaber(?:in)?\\b","\\beigent[üu]mer(?:in)?\\b"
+), collapse="|"), ignore_case = TRUE)
+
+include_partner_rx <- regex("\\b(managing partner|general partner|founding partner|gp)\\b",
+                            ignore_case = TRUE)
+
+smb_owner_rx <- regex(paste(c(
+  "\\b(shop|salon|bar|cafe|café|restaurant|store|boutique|bakery|hair|nail) owner\\b",
+  "\\bfranchise owner\\b",
+  "\\bowner[-/ ]operator\\b"
+), collapse="|"), ignore_case = TRUE)
+
+include_smb_owners <- TRUE
+
+exclude_rx <- regex(paste(c(
+  "\\bproduct owner\\b",
+  "\\bassistant principal\\b","\\bvice principal\\b",
+  "\\bhr[- ]?partner\\b","\\bhr[- ]?businesspartner\\b","\\bstudent partner\\b",
+  "\\bvice president\\b","\\bsenior vice president\\b","\\bsvp\\b","\\bavp\\b"
+), collapse="|"), ignore_case = TRUE)
+
+owner_founder_signal_rx <- regex(paste(c(
+  "owner","co[- ]?owner","proprietor","founder","co[- ]?founder",
+  "propri[eé]taire","g[ée]rant","fondateur","cofondateur",
+  "propietari[oa]","dueñ[oa]",
+  "propriet[aá]rio","s[óo]ci[ao]",
+  "titolare","socio","inhaber","eigent[üu]mer",
+  "managing partner","general partner","founding partner","\\bgp\\b"
+), collapse="|"), ignore_case = TRUE)
+
+# 3) Score titles in Arrow (no normalization functions)
+pos_scored <- pos %>%
+  mutate(
+    has_core    = str_detect(jobtitle_raw, include_core_rx),
+    has_partner = str_detect(jobtitle_raw, include_partner_rx),
+    has_smb     = if_else(include_smb_owners, str_detect(jobtitle_raw, smb_owner_rx), FALSE),
+    has_exclude = str_detect(jobtitle_raw, exclude_rx),
+    has_owner_founder_signal = str_detect(jobtitle_raw, owner_founder_signal_rx),
+    looks_principal_only = str_detect(jobtitle_raw, regex("\\bprincipal\\b", ignore_case = TRUE)) &
+      !has_owner_founder_signal,
+    is_founder_like = (has_core | has_partner | has_smb) & !has_exclude & !looks_principal_only
+  )
+
+# 4) Arrow-native peek (no collect) – raw, case-sensitive counts
+kept_raw_top <- pos_scored %>%
+  filter(is_founder_like) %>%
+  count(jobtitle_raw, sort = TRUE) %>%
+  head(50) %>%  # just to eyeball; remove head() if you want the whole thing (may be big)
+  collect()
+print(kept_raw_top, n = 50)
+
+# 5) For *normalized* counts, collect only the filtered subset, then normalize in R
+kept_norm <- pos_scored %>%
+  filter(is_founder_like) %>%
+  select(jobtitle_raw) %>%
+  collect() %>%
+  mutate(title_norm = str_squish(str_to_lower(jobtitle_raw))) %>%
+  count(title_norm, sort = TRUE)
+
+removed_norm <- pos_scored %>%
+  filter(has_exclude | looks_principal_only) %>%
+  select(jobtitle_raw) %>%
+  collect() %>%
+  mutate(title_norm = str_squish(str_to_lower(jobtitle_raw))) %>%
+  count(title_norm, sort = TRUE)
+
+# 6) Save to your home space (not in Revelio folders)
+out_dir <- "/mnt/staff/sihwang/ucla_founders_db/review"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(kept_norm,    file.path(out_dir, "kept_titles_with_counts.csv"),             row.names = FALSE)
+write.csv(removed_norm, file.path(out_dir, "removed_false_positive_titles_with_counts.csv"), row.names = FALSE)
